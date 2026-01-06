@@ -2,4 +2,3 @@ ultralytics
 opencv-python-headless
 pandas
 numpy
-openpyxl
