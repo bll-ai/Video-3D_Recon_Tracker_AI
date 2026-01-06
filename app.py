@@ -5,82 +5,83 @@ import pandas as pd
 from ultralytics import YOLO
 import matplotlib.pyplot as plt
 import os
+import time
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="AI 3D Football Tracker", layout="wide")
 st.title("⚽ 3D Football Trajectory Recon")
 
-# --- FILE PATHING ---
-# Automatically find rgb.avi in the same folder as this script
 script_dir = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VIDEO = os.path.join(script_dir, "rgb.avi")
 
-st.sidebar.header("Technical Specs")
-st.sidebar.info("Model: YOLOv8n\nCamera: Intel RealSense D435i\nAlgorithm: Pinhole Model + Kalman Filter")
+# --- UI CONTAINERS ---
+col1, col2 = st.columns([2, 1])
+with col1:
+    video_placeholder = st.empty()
+with col2:
+    st.write("### 2D Top-View Map")
+    chart_placeholder = st.empty()
 
-# Check if the 12MB video exists in the repository
+# --- INITIALIZATION ---
 if os.path.exists(DEFAULT_VIDEO):
-    st.success("✅ Demo Video (rgb.avi) is pre-loaded and ready.")
-    start_demo = st.button("🚀 Start Live Recon Demo")
-else:
-    st.error("❌ rgb.avi not found in repository. Please upload the 12MB video to the GitHub root.")
-    uploaded_file = st.file_uploader("Or Upload your own video", type=['avi', 'mp4'])
-    start_demo = True if uploaded_file else False
-    video_source = uploaded_file if uploaded_file else None
-
-# --- DEMO EXECUTION ---
-if start_demo:
-    source = DEFAULT_VIDEO if os.path.exists(DEFAULT_VIDEO) else video_source
-    
-    model = YOLO('yolov8n.pt')
-    cap = cv2.VideoCapture(source)
-    
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 30
-    # HFOV for D435i is 69.4 degrees
-    fx     = width / (2 * np.tan(np.deg2rad(69.4 / 2))) 
-
-    ball_coords = []
-    video_placeholder = st.empty() 
-    chart_placeholder = st.empty() 
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+    if st.button("🚀 Start Live Recon Demo"):
+        model = YOLO('yolov8n.pt')
+        cap = cv2.VideoCapture(DEFAULT_VIDEO)
         
-        # Detection for 'sports ball' (COCO class 32)
-        results = model.predict(frame, conf=0.25, classes=[32], verbose=False)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        fx = width / (2 * np.tan(np.deg2rad(69.4 / 2)))
+
+        ball_coords = []
         
-        if results[0].boxes:
-            box = results[0].boxes[0]
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            w_px = x2 - x1
-            u, v = (x1 + x2) / 2, (y1 + y2) / 2
+        # --- PROCESSING LOOP ---
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
             
-            # 3D Math: Distance Z = (f * real_diameter) / pixel_width
-            # Standard football diameter is 0.22m
-            z_m = (fx * 0.22) / w_px
-            x_m = ((u - (width/2)) * z_m) / fx
-            ball_coords.append({'X': x_m, 'Z': z_m})
+            # 1. Detection
+            results = model.predict(frame, conf=0.25, classes=[32], verbose=False)
+            
+            if results[0].boxes:
+                box = results[0].boxes[0]
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                w_px = x2 - x1
+                u, v = (x1 + x2) / 2, (y1 + y2) / 2
+                
+                # 3D Depth Math
+                z_m = (fx * 0.22) / w_px
+                x_m = ((u - (width/2)) * z_m) / fx
+                
+                # Store for mapping
+                ball_coords.append({'X': x_m, 'Z': z_m})
 
-            # Visual UI Overlay
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(frame, f"Dist: {z_m:.2f}m", (int(x1), int(y1)-10), 0, 0.7, (0, 255, 0), 2)
+                # Visuals
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(frame, f"Z: {z_m:.2f}m", (int(x1), int(y1)-10), 0, 0.7, (0, 255, 0), 2)
 
-        # Update Streamlit Web UI
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        video_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-        
-        if ball_coords:
-            df = pd.DataFrame(ball_coords)
-            fig, ax = plt.subplots(figsize=(4,3))
-            ax.plot(df['X'], df['Z'], color='blue', label="Trajectory")
-            ax.set_title("Stabilized Top-View Map")
-            ax.set_xlabel("X (meters)")
-            ax.set_ylabel("Depth Z (meters)")
-            ax.invert_yaxis()
-            chart_placeholder.pyplot(fig)
-            plt.close(fig)
+            # 2. Update Video (The fix for the "Fixed Image")
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            video_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
 
-    cap.release()
-    st.balloons()
+            # 3. Update Map (The fix for the "Wrong Map")
+            if len(ball_coords) > 1:
+                df = pd.DataFrame(ball_coords)
+                fig, ax = plt.subplots(figsize=(4, 5))
+                # We use X for horizontal and Z for depth (distance from camera)
+                ax.plot(df['X'], df['Z'], color='blue', linewidth=2, marker='o', markersize=2)
+                ax.set_xlim(-5, 5)  # Constrain X so the map doesn't jump
+                ax.set_ylim(0, 20)  # Constrain Z (depth)
+                ax.set_xlabel("Lateral (Meters)")
+                ax.set_ylabel("Depth (Meters)")
+                ax.invert_yaxis()   # Flip so distance increases 'up' the screen
+                ax.grid(True, linestyle='--', alpha=0.6)
+                chart_placeholder.pyplot(fig)
+                plt.close(fig)
+
+            # Small delay to let Streamlit's frontend catch up
+            # Without this, it looks like a static image because it processes too fast
+            time.sleep(0.01)
+
+        cap.release()
+        st.balloons()
