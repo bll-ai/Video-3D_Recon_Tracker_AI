@@ -7,41 +7,68 @@ import matplotlib.pyplot as plt
 import os
 import time
 
-# --- PAGE SETUP ---
-st.set_page_config(page_title="AI 3D Football Tracker", layout="wide")
-st.title("⚽ 3D Football Trajectory Recon")
+# --- 1. PAGE & UI INITIALIZATION ---
+st.set_page_config(page_title="3D Football Recon Demo", layout="wide")
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; }
+    h1 { color: #00ff00; text-align: center; }
+    </style>
+    """, unsafe_allow_html=True)
 
+st.title("⚽ Live AI 3D Football Reconstruction")
+
+# Path to your 12MB video in the GitHub repo
 script_dir = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_VIDEO = os.path.join(script_dir, "rgb.avi")
+VIDEO_PATH = os.path.join(script_dir, "rgb.avi")
 
-# --- UI CONTAINERS ---
-col1, col2 = st.columns([2, 1])
-with col1:
-    video_placeholder = st.empty()
-with col2:
-    st.write("### 2D Top-View Map")
-    chart_placeholder = st.empty()
+# Layout: Video on the left, Stabilized Map on the right
+col_vid, col_map = st.columns([3, 2])
 
-# --- INITIALIZATION ---
-if os.path.exists(DEFAULT_VIDEO):
-    if st.button("🚀 Start Live Recon Demo"):
+with col_vid:
+    st.subheader("AI Vision Feed")
+    video_frame = st.empty()
+
+with col_map:
+    st.subheader("Stabilized 3D Ground Map")
+    map_plot = st.empty()
+    metrics = st.empty()
+
+# --- 2. THE PROCESSING ENGINE ---
+if os.path.exists(VIDEO_PATH):
+    # Auto-start logic: No need for user to upload anything
+    if st.sidebar.button("🚀 Start Live Demo", use_container_width=True):
+        
+        # Load YOLOv8 Nano (optimized for web speed)
         model = YOLO('yolov8n.pt')
-        cap = cv2.VideoCapture(DEFAULT_VIDEO)
+        cap = cv2.VideoCapture(VIDEO_PATH)
         
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        # Camera Specs: Intel RealSense D435i
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        fx = width / (2 * np.tan(np.deg2rad(69.4 / 2)))
-
-        ball_coords = []
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 30
+        HFOV   = 69.4
+        fx     = width / (2 * np.tan(np.deg2rad(HFOV / 2)))
         
-        # --- PROCESSING LOOP ---
+        # Data Buffers
+        trajectory_x = []
+        trajectory_z = []
+        
+        # Kalman Filter initialization for smoothing (stops the map from jittering)
+        kf = cv2.KalmanFilter(4, 2)
+        kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
+        kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                break
             
-            # 1. Detection
+            # AI Inference
             results = model.predict(frame, conf=0.25, classes=[32], verbose=False)
+            
+            z_m, x_m = 0.0, 0.0
             
             if results[0].boxes:
                 box = results[0].boxes[0]
@@ -49,39 +76,65 @@ if os.path.exists(DEFAULT_VIDEO):
                 w_px = x2 - x1
                 u, v = (x1 + x2) / 2, (y1 + y2) / 2
                 
-                # 3D Depth Math
-                z_m = (fx * 0.22) / w_px
-                x_m = ((u - (width/2)) * z_m) / fx
+                # Pinhole Math: Depth (Z) and Lateral (X)
+                z_m = (fx * 0.22) / w_px  # 0.22m = standard football
+                x_m = ((u - (width / 2)) * z_m) / fx
                 
-                # Store for mapping
-                ball_coords.append({'X': x_m, 'Z': z_m})
+                # Kalman Smoothing
+                kf.correct(np.array([[np.float32(x_m)], [np.float32(z_m)]]))
+                predict = kf.predict()
+                x_m, z_m = predict[0][0], predict[1][0]
 
-                # Visuals
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                cv2.putText(frame, f"Z: {z_m:.2f}m", (int(x1), int(y1)-10), 0, 0.7, (0, 255, 0), 2)
+                trajectory_x.append(x_m)
+                trajectory_z.append(z_m)
 
-            # 2. Update Video (The fix for the "Fixed Image")
+                # Draw Overlay
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 3)
+                cv2.putText(frame, f"Depth: {z_m:.1f}m", (int(x1), int(y1)-15), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # --- UPDATE UI ---
+            # 1. Update Video Feed (RGB Conversion for Streamlit)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            video_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
+            video_frame.image(frame_rgb, channels="RGB")
 
-            # 3. Update Map (The fix for the "Wrong Map")
-            if len(ball_coords) > 1:
-                df = pd.DataFrame(ball_coords)
-                fig, ax = plt.subplots(figsize=(4, 5))
-                # We use X for horizontal and Z for depth (distance from camera)
-                ax.plot(df['X'], df['Z'], color='blue', linewidth=2, marker='o', markersize=2)
-                ax.set_xlim(-5, 5)  # Constrain X so the map doesn't jump
-                ax.set_ylim(0, 20)  # Constrain Z (depth)
-                ax.set_xlabel("Lateral (Meters)")
-                ax.set_ylabel("Depth (Meters)")
-                ax.invert_yaxis()   # Flip so distance increases 'up' the screen
-                ax.grid(True, linestyle='--', alpha=0.6)
-                chart_placeholder.pyplot(fig)
+            # 2. Update 2D Map (Fixed Scale for Professional Look)
+            if len(trajectory_x) > 1:
+                fig, ax = plt.subplots(figsize=(5, 7))
+                fig.patch.set_facecolor('#0e1117')
+                ax.set_facecolor('#1e2129')
+                
+                # Plot trajectory
+                ax.plot(trajectory_x, trajectory_z, color='#00ff00', linewidth=2, marker='o', markersize=3, alpha=0.7)
+                
+                # Fixed Axis Limits: Prevents the "jumping/wrong map" feeling
+                ax.set_xlim(-6, 6)    # 6 meters left/right
+                ax.set_ylim(0, 30)    # 30 meters depth
+                
+                # Visual Styling
+                ax.invert_yaxis()
+                ax.set_xlabel("Lateral Offset (m)", color='white')
+                ax.set_ylabel("Distance from Camera (m)", color='white')
+                ax.tick_params(colors='white')
+                ax.grid(True, linestyle='--', alpha=0.3)
+                
+                map_plot.pyplot(fig)
                 plt.close(fig)
 
-            # Small delay to let Streamlit's frontend catch up
-            # Without this, it looks like a static image because it processes too fast
+                # 3. Update Metrics Dashboard
+                metrics.markdown(f"""
+                | Metric | Value |
+                | :--- | :--- |
+                | **Current Depth** | {z_m:.2f} m |
+                | **Lateral Pos** | {x_m:.2f} m |
+                | **Frames Tracked** | {len(trajectory_x)} |
+                """)
+
+            # Control playback speed for the browser
             time.sleep(0.01)
 
         cap.release()
+        st.success("🏁 Reconstruction Completed Successfully.")
         st.balloons()
+else:
+    st.error(f"Missing File: Could not find 'rgb.avi' at {VIDEO_PATH}. Please ensure it is uploaded to your GitHub repository.")
